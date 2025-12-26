@@ -3,13 +3,21 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"sync"
 
+	zmq "github.com/go-zeromq/zmq4" // just want some of the enums, nothing else 😜
 	"github.com/lqqyt2423/go-mitmproxy/internal/helper"
+	mymetrics "github.com/lqqyt2423/go-mitmproxy/metrics"
+	mysnmp "github.com/lqqyt2423/go-mitmproxy/snmp"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	do "github.com/samber/do/v2"
+	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 // wrap tcpListener for remote client
@@ -143,6 +151,16 @@ func newEntry(proxy *Proxy) *entry {
 			return context.WithValue(ctx, connContextKey, c.(*wrapClientConn).connCtx)
 		},
 	}
+	if e.proxy.Opts.TracingOptions != nil || e.proxy.Opts.MetricsOptions != nil {
+		originalHandler := e.server.Handler // avoid call stack overflow
+		opts := []otelhttp.Option{}
+		if e.proxy.Opts.TracingOptions != nil {
+			opts = append(opts, otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				return otelSpanNameFormatter(r)
+			}))
+		} // end if
+		e.server.Handler = otelTraced(originalHandler, opts...)
+	} // end if
 	return e
 }
 
@@ -156,6 +174,33 @@ func (e *entry) start() error {
 		return err
 	}
 
+	if e.proxy.Opts.MetricsOptions != nil && e.proxy.Opts.MetricsOptions.Mode == string(zmq.Pull) {
+		go (func() {
+			switch e.proxy.Opts.MetricsOptions.Type {
+			case "prometheus":
+				logrus.WithField("type", e.proxy.Opts.MetricsOptions.Type).WithField("metrics_path", e.proxy.Opts.MetricsOptions.MetricsPath).Infof("Metrics exporter listening at %s", e.proxy.Opts.MetricsOptions.Addr)
+				go (func() {
+					h := promhttp.Handler()
+					mux := http.NewServeMux()
+					mux.Handle(e.proxy.Opts.MetricsOptions.MetricsPath, h)
+					wrapped_handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { // wrap the mux with a custom handler that returns 404 for all unmatched routes
+						_, pattern := mux.Handler(r)
+						if pattern == "" || (pattern == "/" && r.URL.Path != "/") {
+							http.NotFound(w, r)
+							return
+						} // end if
+						mux.ServeHTTP(w, r)
+					})
+					http.ListenAndServe(e.proxy.Opts.MetricsOptions.Addr, wrapped_handler)
+				})()
+			case "snmp":
+				recorder := do.MustInvoke[*mymetrics.SNMPRecorder](e.proxy.injector)
+				go mysnmp.StartSnmpd(e.proxy.Opts.MetricsOptions.Addr, e.proxy.Opts.MetricsOptions.SNMPCommunity, e.proxy.Opts.Addr, e.proxy.Version, recorder.OIDs())
+			default:
+				panic(fmt.Sprintf("unsupported metrics backend ‘%+v’", e.proxy.Opts.MetricsOptions.Type))
+			} // end switch
+		})()
+	} // end if
 	log.Infof("Proxy start listen at %v\n", e.server.Addr)
 	pln := &wrapListener{
 		Listener: ln,
@@ -251,17 +296,17 @@ func (e *entry) handleConnect(res http.ResponseWriter, req *http.Request) {
 func (e *entry) establishConnection(res http.ResponseWriter, f *Flow) (net.Conn, error) {
 	cconn, _, err := res.(http.Hijacker).Hijack()
 	if err != nil {
-		res.WriteHeader(502)
+		res.WriteHeader(http.StatusBadGateway)
 		return nil, err
 	}
-	_, err = io.WriteString(cconn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	_, err = io.WriteString(cconn, fmt.Sprintf("HTTP/1.1 %d Connection Established\r\n\r\n", http.StatusOK))
 	if err != nil {
 		cconn.Close()
 		return nil, err
 	}
 
 	f.Response = &Response{
-		StatusCode: 200,
+		StatusCode: http.StatusOK,
 		Header:     make(http.Header),
 	}
 
@@ -283,7 +328,7 @@ func (e *entry) directTransfer(res http.ResponseWriter, req *http.Request, f *Fl
 	conn, err := proxy.getUpstreamConn(req.Context(), req)
 	if err != nil {
 		log.Error(err)
-		res.WriteHeader(502)
+		res.WriteHeader(http.StatusBadGateway)
 		return
 	}
 	defer conn.Close()
@@ -304,11 +349,12 @@ func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request,
 		"in":   "Proxy.entry.httpsDialFirstAttack",
 		"host": req.Host,
 	})
+	reqCtx := helper.ContextAddKey(req.Context(), "request.url", f.Request.URL)
 
-	conn, err := proxy.attacker.httpsDial(req.Context(), req)
+	conn, err := proxy.attacker.httpsDial(reqCtx, req)
 	if err != nil {
 		log.Error(err)
-		res.WriteHeader(502)
+		res.WriteHeader(http.StatusBadGateway)
 		return
 	}
 
@@ -336,7 +382,7 @@ func (e *entry) httpsDialFirstAttack(res http.ResponseWriter, req *http.Request,
 
 	// is tls
 	f.ConnContext.ClientConn.Tls = true
-	proxy.attacker.httpsTlsDial(req.Context(), cconn, conn)
+	proxy.attacker.httpsTlsDial(reqCtx, cconn, conn)
 }
 
 func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, f *Flow) {
@@ -345,6 +391,7 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 		"in":   "Proxy.entry.httpsDialLazyAttack",
 		"host": req.Host,
 	})
+	reqCtx := helper.ContextAddKey(req.Context(), "request.url", f.Request.URL)
 
 	cconn, err := e.establishConnection(res, f)
 	if err != nil {
@@ -361,7 +408,7 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 
 	if !helper.IsTls(peek) {
 		// todo: http, ws
-		conn, err := proxy.attacker.httpsDial(req.Context(), req)
+		conn, err := proxy.attacker.httpsDial(reqCtx, req)
 		if err != nil {
 			cconn.Close()
 			log.Error(err)
@@ -375,5 +422,5 @@ func (e *entry) httpsDialLazyAttack(res http.ResponseWriter, req *http.Request, 
 
 	// is tls
 	f.ConnContext.ClientConn.Tls = true
-	proxy.attacker.httpsLazyAttack(req.Context(), cconn, req)
+	proxy.attacker.httpsLazyAttack(reqCtx, cconn, req)
 }

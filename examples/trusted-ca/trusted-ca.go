@@ -5,22 +5,28 @@ import (
 	"crypto/x509"
 	"errors"
 	"sync"
+	"time"
 
-	"github.com/golang/groupcache/lru"
+	"github.com/datasapiens/cachier"
 	"github.com/golang/groupcache/singleflight"
+	mycache "github.com/lqqyt2423/go-mitmproxy/cache"
 	"github.com/lqqyt2423/go-mitmproxy/cert"
 	log "github.com/sirupsen/logrus"
 )
 
 type TrustedCA struct {
-	cache   *lru.Cache
+	cache   *cachier.Cache[any]
 	group   *singleflight.Group
 	cacheMu sync.Mutex
 }
 
 func NewTrustedCA() (cert.CA, error) {
+	cacheEngine, errCache := mycache.NewPkgzExpirableCache(100, cert.DEFAULT_CERT_TTL, true)
+	if errCache != nil {
+		return nil, errCache
+	} // end if
 	ca := &TrustedCA{
-		cache: lru.New(100),
+		cache: cachier.MakeCache[any](cacheEngine, log.StandardLogger()),
 		group: new(singleflight.Group),
 	}
 	return ca, nil
@@ -30,30 +36,35 @@ func (ca *TrustedCA) GetRootCA() *x509.Certificate {
 	panic("not supported")
 }
 
-func (ca *TrustedCA) GetCert(commonName string) (*tls.Certificate, error) {
-	ca.cacheMu.Lock()
-	if val, ok := ca.cache.Get(commonName); ok {
-		ca.cacheMu.Unlock()
-		log.Debugf("ca GetCert: %v", commonName)
+func (ca *TrustedCA) GetCertWithTtl(commonName string, ttl time.Duration) (*tls.Certificate, error) {
+	getter := func() (*tls.Certificate, error) {
+		val, err := ca.group.Do(commonName, func() (interface{}, error) {
+			return ca.loadCert(commonName)
+		})
+		if err != nil {
+			return nil, err
+		} // end if
 		return val.(*tls.Certificate), nil
 	}
-	ca.cacheMu.Unlock()
+	ca.cacheMu.Lock()
+	defer ca.cacheMu.Unlock()
+	var cert *tls.Certificate
+	var err error
+	ptrAny, _, ee := mycache.GetOrComputeValueWithTTL[*tls.Certificate](ca.cache, commonName, func() (*any, error) {
+		var ptr any
+		var err error
+		ptr, err = getter()
+		return &ptr, err
+	}, ttl)
+	err = ee
+	if ptrAny != nil {
+		cert = *ptrAny
+	} // end if
+	return cert, err
+}
 
-	val, err := ca.group.Do(commonName, func() (interface{}, error) {
-		certificate, err := ca.loadCert(commonName)
-		if err == nil {
-			ca.cacheMu.Lock()
-			ca.cache.Add(commonName, certificate)
-			ca.cacheMu.Unlock()
-		}
-		return certificate, err
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return val.(*tls.Certificate), nil
+func (ca *TrustedCA) GetCert(commonName string) (*tls.Certificate, error) {
+	return ca.GetCertWithTtl(commonName, cert.DEFAULT_CERT_TTL)
 }
 
 func (ca *TrustedCA) loadCert(commonName string) (*tls.Certificate, error) {

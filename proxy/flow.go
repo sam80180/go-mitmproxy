@@ -1,11 +1,14 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 
 	uuid "github.com/satori/go.uuid"
 )
@@ -99,13 +102,33 @@ type Response struct {
 	Body       []byte      `json:"-"`
 	BodyReader io.Reader
 
-	close bool // connection close
+	raw   *http.Response
+	Close bool // connection close
 }
+
+func (r *Response) Raw() *http.Response {
+	return r.raw
+} // end Raw()
+
+func (response *Response) Reconstruct() *http.Response {
+	if response.raw == nil { // re-construct response
+		response.raw = &http.Response{
+			Status:        fmt.Sprintf("%d %s", response.StatusCode, http.StatusText(response.StatusCode)),
+			StatusCode:    response.StatusCode,
+			Header:        response.Header,
+			Close:         response.Close,
+			ContentLength: int64(len(response.Body)),
+		}
+	} // end if
+	response.raw.Body = io.NopCloser(bytes.NewReader(response.Body)) // re-construct body stream
+	return response.raw
+} // end Reconstruct()
 
 // flow
 type Flow struct {
 	Id          uuid.UUID
 	ConnContext *ConnContext
+	StartTime   time.Time
 	Request     *Request
 	Response    *Response
 
@@ -118,8 +141,9 @@ type Flow struct {
 
 func newFlow() *Flow {
 	return &Flow{
-		Id:   uuid.NewV4(),
-		done: make(chan struct{}),
+		Id:        uuid.NewV4(),
+		StartTime: time.Now(),
+		done:      make(chan struct{}),
 	}
 }
 
@@ -138,3 +162,7 @@ func (f *Flow) MarshalJSON() ([]byte, error) {
 	j["response"] = f.Response
 	return json.Marshal(j)
 }
+
+func (f *Flow) ElapsedTime() time.Duration {
+	return time.Now().Sub(f.StartTime)
+} // end ElapsedTime()

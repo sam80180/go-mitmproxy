@@ -19,8 +19,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/groupcache/lru"
+	"github.com/datasapiens/cachier"
 	"github.com/golang/groupcache/singleflight"
+	mycache "github.com/lqqyt2423/go-mitmproxy/cache"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -30,12 +31,14 @@ import (
 
 var errCaNotFound = errors.New("ca not found")
 
+const DEFAULT_CERT_TTL time.Duration = time.Hour * 24 * 365
+
 type SelfSignCA struct {
 	rsa.PrivateKey
 	RootCert  x509.Certificate
 	StorePath string
 
-	cache *lru.Cache
+	cache *cachier.Cache[any]
 	group *singleflight.Group
 
 	cacheMu sync.Mutex
@@ -54,7 +57,7 @@ func createCert() (*rsa.PrivateKey, *x509.Certificate, error) {
 			Organization: []string{"mitmproxy"},
 		},
 		NotBefore:             time.Now().Add(-time.Hour * 48),
-		NotAfter:              time.Now().Add(time.Hour * 24 * 365 * 3),
+		NotAfter:              time.Now().Add(DEFAULT_CERT_TTL * 3),
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		SignatureAlgorithm:    x509.SHA256WithRSA,
@@ -89,11 +92,15 @@ func NewSelfSignCAMemory() (CA, error) {
 	if err != nil {
 		return nil, err
 	}
+	cacheEngine, errCache := mycache.NewPkgzExpirableCache(100, DEFAULT_CERT_TTL, true)
+	if errCache != nil {
+		return nil, errCache
+	} // end if
 	return &SelfSignCA{
 		PrivateKey: *key,
 		RootCert:   *cert,
 		StorePath:  "",
-		cache:      lru.New(100),
+		cache:      cachier.MakeCache[any](cacheEngine, log.StandardLogger()),
 		group:      new(singleflight.Group),
 	}, nil
 }
@@ -104,10 +111,13 @@ func NewSelfSignCA(path string) (CA, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	cacheEngine, errCache := mycache.NewPkgzExpirableCache(100, DEFAULT_CERT_TTL, true)
+	if errCache != nil {
+		return nil, errCache
+	} // end if
 	ca := &SelfSignCA{
 		StorePath: storePath,
-		cache:     lru.New(100),
+		cache:     cachier.MakeCache[any](cacheEngine, log.StandardLogger()),
 		group:     new(singleflight.Group),
 	}
 
@@ -303,34 +313,58 @@ func (ca *SelfSignCA) GetRootCA() *x509.Certificate {
 	return &ca.RootCert
 }
 
-func (ca *SelfSignCA) GetCert(commonName string) (*tls.Certificate, error) {
-	ca.cacheMu.Lock()
-	if val, ok := ca.cache.Get(commonName); ok {
-		ca.cacheMu.Unlock()
-		log.Debugf("ca GetCert: %v", commonName)
+func (ca *SelfSignCA) GetCertWithTtl(commonName string, ttl time.Duration) (*tls.Certificate, error) {
+	getter := func() (*tls.Certificate, error) {
+		val, err := ca.group.Do(commonName, func() (any, error) {
+			log.Debugf("ca GetCert: %v", commonName)
+			return ca.DummyCertWithTtl(commonName, ttl)
+		})
+		if err != nil {
+			return nil, err
+		} // end if
 		return val.(*tls.Certificate), nil
 	}
-	ca.cacheMu.Unlock()
-
-	val, err := ca.group.Do(commonName, func() (interface{}, error) {
-		cert, err := ca.DummyCert(commonName)
-		if err == nil {
-			ca.cacheMu.Lock()
-			ca.cache.Add(commonName, cert)
-			ca.cacheMu.Unlock()
-		}
-		return cert, err
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return val.(*tls.Certificate), nil
+	ca.cacheMu.Lock()
+	defer ca.cacheMu.Unlock()
+	var cert *tls.Certificate
+	var err error
+	lstSAN := toWildcardSAN(commonName)
+	for i := len(lstSAN) - 1; i >= 0; i-- {
+		san := lstSAN[i]
+		ptrAny, bHit, ee := mycache.GetOrComputeValueWithTTL[*tls.Certificate](ca.cache, san, func() (*any, error) {
+			var ptr any
+			var err error
+			ptr, err = getter()
+			return &ptr, err
+		}, ttl)
+		err = ee
+		if ptrAny != nil {
+			cert = *ptrAny
+			if bHit {
+				log.Debugf("Cert cache hit: %s", san)
+			} else {
+				if err == nil && cert != nil {
+					log.Debugf("Cache cert: %s", san)
+					for _, san0 := range lstSAN {
+						if san0 != san {
+							log.Debugf("Cache cert: %s", san0)
+							mycache.SetValueWithTtl(ca.cache, san0, cert, ttl)
+						} // end if
+					} // end for
+				} // end if
+			} // end if
+			break
+		} // end if
+	} // end for
+	return cert, err
 }
 
+func (ca *SelfSignCA) GetCert(commonName string) (*tls.Certificate, error) {
+	return ca.GetCertWithTtl(commonName, DEFAULT_CERT_TTL)
+} // end GetCert()
+
 // TODO: 是否应该支持多个 SubjectAltName
-func (ca *SelfSignCA) DummyCert(commonName string) (*tls.Certificate, error) {
+func (ca *SelfSignCA) DummyCertWithTtl(commonName string, ttl time.Duration) (*tls.Certificate, error) {
 	log.Debugf("ca DummyCert: %v", commonName)
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano() / 100000),
@@ -339,17 +373,18 @@ func (ca *SelfSignCA) DummyCert(commonName string) (*tls.Certificate, error) {
 			Organization: []string{"mitmproxy"},
 		},
 		NotBefore:          time.Now().Add(-time.Hour * 48),
-		NotAfter:           time.Now().Add(time.Hour * 24 * 365),
+		NotAfter:           time.Now().Add(ttl),
 		SignatureAlgorithm: x509.SHA256WithRSA,
 		ExtKeyUsage:        []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
 
-	ip := net.ParseIP(commonName)
-	if ip != nil {
-		template.IPAddresses = []net.IP{ip}
-	} else {
-		template.DNSNames = []string{commonName}
-	}
+	for _, san := range toWildcardSAN(commonName) {
+		if ip := net.ParseIP(san); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = append(template.DNSNames, san)
+		} // end if
+	} // end for
 
 	certBytes, err := x509.CreateCertificate(rand.Reader, template, &ca.RootCert, &ca.PrivateKey.PublicKey, &ca.PrivateKey)
 	if err != nil {
@@ -363,3 +398,18 @@ func (ca *SelfSignCA) DummyCert(commonName string) (*tls.Certificate, error) {
 
 	return cert, nil
 }
+
+func (ca *SelfSignCA) DummyCert(commonName string) (*tls.Certificate, error) {
+	return ca.DummyCertWithTtl(commonName, DEFAULT_CERT_TTL)
+} // end DummyCert()
+
+func toWildcardSAN(commonName string) []string {
+	lst := []string{commonName}
+	if ip := net.ParseIP(commonName); ip == nil { // not an IP
+		if parts := strings.Split(commonName, "."); len(parts) > 2 {
+			parts[0] = "*"
+			lst = append(lst, strings.Join(parts, "."))
+		} // end if
+	} // end if
+	return lst
+} // end toWildcardSAN()

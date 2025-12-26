@@ -34,14 +34,14 @@ func (s *webSocket) wss(res http.ResponseWriter, req *http.Request) {
 	upgradeBuf, err := httputil.DumpRequest(req, false)
 	if err != nil {
 		log.Errorf("DumpRequest: %v\n", err)
-		res.WriteHeader(502)
+		res.WriteHeader(http.StatusBadGateway)
 		return
 	}
 
 	cconn, _, err := res.(http.Hijacker).Hijack()
 	if err != nil {
 		log.Errorf("Hijack: %v\n", err)
-		res.WriteHeader(502)
+		res.WriteHeader(http.StatusBadGateway)
 		return
 	}
 	defer cconn.Close()

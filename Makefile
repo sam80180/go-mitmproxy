@@ -2,7 +2,7 @@ all: mitmproxy
 
 .PHONY: mitmproxy
 mitmproxy:
-	go build -o go-mitmproxy cmd/go-mitmproxy/*.go
+	sh -c 'cd cmd/go-mitmproxy && go build -o ../../go-mitmproxy'
 
 .PHONY: dummycert
 dummycert:

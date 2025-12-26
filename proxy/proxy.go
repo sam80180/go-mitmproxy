@@ -8,10 +8,19 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/datasapiens/cachier"
 	"github.com/lqqyt2423/go-mitmproxy/cert"
 	"github.com/lqqyt2423/go-mitmproxy/internal/helper"
+	myipc "github.com/lqqyt2423/go-mitmproxy/ipc"
+	mymetrics "github.com/lqqyt2423/go-mitmproxy/metrics"
+	mytracing "github.com/lqqyt2423/go-mitmproxy/tracing"
+	do "github.com/samber/do/v2"
+	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
 )
+
+const SERVICE_NAME string = "mitmproxy"
+const APP_VERSION string = "1.8.5"
 
 type Options struct {
 	Debug             int
@@ -21,7 +30,10 @@ type Options struct {
 	CaRootPath        string
 	NewCaFunc         func() (cert.CA, error) //创建 Ca 的函数
 	Upstream          string
-	LogFilePath       string // Path to write logs to file
+
+	MetricsOptions *mymetrics.MetricsOptions
+	TracingOptions *mytracing.TracingOptions
+	IPCOptions     *myipc.IPCOptions
 }
 
 type Proxy struct {
@@ -29,27 +41,51 @@ type Proxy struct {
 	Version string
 	Addons  []Addon
 
+	injector        do.Injector
 	entry           *entry
 	attacker        *attacker
 	shouldIntercept func(req *http.Request) bool              // req is received by proxy.server
 	upstreamProxy   func(req *http.Request) (*url.URL, error) // req is received by proxy.server, not client request
 	authProxy       func(res http.ResponseWriter, req *http.Request) (bool, error)
+	cache           *cachier.Cache[any]
 }
 
 // proxy.server req context key
 var proxyReqCtxKey = new(struct{})
 
-func NewProxy(opts *Options) (*Proxy, error) {
+func NewProxyWithDI(opts *Options, di do.Injector) (*Proxy, error) {
 	if opts.StreamLargeBodies <= 0 {
 		opts.StreamLargeBodies = 1024 * 1024 * 5 // default: 5mb
 	}
 
 	proxy := &Proxy{
-		Opts:    opts,
-		Version: "1.8.7",
-		Addons:  make([]Addon, 0),
+		Opts:     opts,
+		Version:  APP_VERSION,
+		Addons:   make([]Addon, 0),
+		injector: di,
 	}
 
+	if proxy.Opts.MetricsOptions != nil {
+		if errMtr := initMeter(proxy, *proxy.Opts.MetricsOptions); errMtr != nil {
+			return nil, errMtr
+		} // end if
+	} // end if
+	if proxy.Opts.TracingOptions != nil {
+		if errTp := initTracer(proxy, *proxy.Opts.TracingOptions); errTp != nil {
+			return nil, errTp
+		} // end if
+	} // end if
+	if proxy.Opts.IPCOptions != nil {
+		ipc := myipc.NewIPC(*proxy.Opts.IPCOptions)
+		do.Provide(proxy.injector, func(do.Injector) (*myipc.IPC, error) {
+			return ipc, nil
+		})
+		go (func() {
+			if err := ipc.Run(); err != nil {
+				logrus.Errorf("IPC error: %+v", err)
+			} // end if
+		})()
+	} // end if
 	proxy.entry = newEntry(proxy)
 
 	attacker, err := newAttacker(proxy)
@@ -60,6 +96,22 @@ func NewProxy(opts *Options) (*Proxy, error) {
 
 	return proxy, nil
 }
+
+func NewProxy(opts *Options) (*Proxy, error) {
+	return NewProxyWithDI(opts, do.New())
+} // end NewProxy()
+
+func (proxy *Proxy) InitCache(engine cachier.CacheEngine) {
+	proxy.cache = cachier.MakeCache[any](engine, log.StandardLogger())
+} // end InitCache()
+
+func (proxy *Proxy) Cache() *cachier.Cache[any] {
+	return proxy.cache
+} // end Cache()
+
+func (proxy *Proxy) DI() do.Injector {
+	return proxy.injector
+} // end DI()
 
 func (proxy *Proxy) AddAddon(addon Addon) {
 	proxy.Addons = append(proxy.Addons, addon)

@@ -1,0 +1,9 @@
+FROM centos:7.7.1908 AS build_mitmproxy
+
+ENV PATH=$PATH:/usr/local/go/bin
+
+# for building my modifications
+ENV CGO_ENABLED=1 CGO_CFLAGS="-I/usr/local" GOPATH=/
+
+COPY setup.sh /
+RUN /setup.sh; rm -f /setup.sh

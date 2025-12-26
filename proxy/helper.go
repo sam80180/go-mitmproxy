@@ -27,7 +27,7 @@ func logErr(log *log.Entry, err error) (loged bool) {
 
 	for _, str := range normalErrMsgs {
 		if strings.Contains(msg, str) {
-			log.Debug(err)
+			log.Error(err)
 			return
 		}
 	}

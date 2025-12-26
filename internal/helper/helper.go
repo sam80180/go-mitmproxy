@@ -87,3 +87,23 @@ func (r *ResponseCheck) Write(bytes []byte) (int, error) {
 	r.Wrote = true
 	return r.ResponseWriter.Write(bytes)
 }
+
+func ToType[T any](a any) (T, bool) {
+	v, ok := a.(T)
+	return v, ok
+} // end ToType()
+
+func ChunkSlice[T any](slice []T, size int) [][]T {
+	if size <= 0 {
+		return nil
+	} // end if
+	var chunks [][]T
+	for i := 0; i < len(slice); i += size {
+		end := i + size
+		if end > len(slice) {
+			end = len(slice)
+		} // end if
+		chunks = append(chunks, slice[i:end])
+	} // end for
+	return chunks
+} // end ChunkSlice()

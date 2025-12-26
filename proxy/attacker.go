@@ -12,6 +12,9 @@ import (
 	"github.com/lqqyt2423/go-mitmproxy/cert"
 	"github.com/lqqyt2423/go-mitmproxy/internal/helper"
 	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http2"
 )
 
@@ -32,7 +35,8 @@ func (l *attackerListener) Addr() net.Addr { return nil }
 
 type attackerConn struct {
 	net.Conn
-	connCtx *ConnContext
+	connCtx        *ConnContext
+	originalReqCtx context.Context
 }
 
 type attacker struct {
@@ -76,10 +80,38 @@ func newAttacker(proxy *Proxy) (*attacker, error) {
 	a.server = &http.Server{
 		Handler: a,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			return context.WithValue(ctx, connContextKey, c.(*attackerConn).connCtx)
+			if attackConn, bIsAttackConn := c.(*attackerConn); bIsAttackConn {
+				ctx = context.WithValue(ctx, connContextKey, attackConn.connCtx)
+				if sc := trace.SpanContextFromContext(attackConn.originalReqCtx); sc.IsValid() {
+					ctx = trace.ContextWithRemoteSpanContext(ctx, sc)
+					ctx = helper.ContextCopyKeysFn(attackConn.originalReqCtx, ctx, func(k, _ any) bool {
+						return helper.IsInstanceOfContextKey(k)
+					})
+					var span trace.Span
+					ctx, span = otel.Tracer("").Start(ctx, "HTTP/1.x")
+					go (func() {
+						if clientConn, bIsClientConn := attackConn.connCtx.ClientConn.Conn.(*wrapClientConn); bIsClientConn {
+							<-clientConn.closeChan
+							span.End()
+						} // end if
+					})()
+				} // end if
+			} // end if
+			return ctx
 		},
 	}
 
+	if proxy.Opts.TracingOptions != nil || proxy.Opts.MetricsOptions != nil {
+		a.client.Transport = otelhttp.NewTransport(a.client.Transport)
+		originalHandler := a.server.Handler // avoid call stack overflow
+		opts := []otelhttp.Option{}
+		if proxy.Opts.TracingOptions != nil {
+			opts = append(opts, otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				return otelSpanNameFormatter(r)
+			}))
+		} // end if
+		a.server.Handler = otelTraced(originalHandler, opts...)
+	} // end if
 	a.h2Server = &http2.Server{
 		MaxConcurrentStreams: 100, // todo: wait for remote server setting
 		NewWriteScheduler:    func() http2.WriteScheduler { return http2.NewPriorityWriteScheduler(nil) },
@@ -100,9 +132,9 @@ func (a *attacker) start() error {
 	return a.server.Serve(a.listener)
 }
 
-func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
+func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext, reqCtx context.Context) {
 	connCtx.ClientConn.NegotiatedProtocol = clientTlsConn.ConnectionState().NegotiatedProtocol
-
+	sc := trace.SpanContextFromContext(reqCtx)
 	if connCtx.ClientConn.NegotiatedProtocol == "h2" && connCtx.ServerConn != nil {
 		connCtx.ServerConn.client = &http.Client{
 			Transport: &http2.Transport{
@@ -118,24 +150,44 @@ func (a *attacker) serveConn(clientTlsConn *tls.Conn, connCtx *ConnContext) {
 		}
 
 		ctx := context.WithValue(context.Background(), connContextKey, connCtx)
+		var fnSpanEnd func() = nil
+		if a.proxy.Opts.TracingOptions != nil {
+			ctx = helper.ContextCopyKeysFn(reqCtx, ctx, func(k, _ any) bool {
+				return helper.IsInstanceOfContextKey(k)
+			})
+			if sc.IsValid() {
+				ctx = trace.ContextWithRemoteSpanContext(ctx, sc)
+				var span trace.Span
+				ctx, span = otel.Tracer("").Start(ctx, "HTTP/2")
+				fnSpanEnd = func() { span.End() }
+			} // end if
+		} // end if
 		ctx, cancel := context.WithCancel(ctx)
 		go func() {
 			<-connCtx.ClientConn.Conn.(*wrapClientConn).closeChan
 			cancel()
+			if fnSpanEnd != nil {
+				fnSpanEnd()
+			} // end if
 		}()
 		go func() {
 			a.h2Server.ServeConn(clientTlsConn, &http2.ServeConnOpts{
 				Context:    ctx,
-				Handler:    a,
+				Handler:    a.server.Handler,
 				BaseConfig: a.server,
 			})
 		}()
 		return
 	}
 
+	reqCtxCloned, _ := helper.CloneContextFullyFn(reqCtx, func(k, _ any) bool {
+		return helper.IsInstanceOfContextKey(k)
+	})
+	reqCtxCloned = trace.ContextWithRemoteSpanContext(reqCtxCloned, sc)
 	a.listener.accept(&attackerConn{
-		Conn:    clientTlsConn,
-		connCtx: connCtx,
+		Conn:           clientTlsConn,
+		connCtx:        connCtx,
+		originalReqCtx: reqCtxCloned,
 	})
 }
 
@@ -372,7 +424,7 @@ func (a *attacker) httpsTlsDial(ctx context.Context, cconn net.Conn, conn net.Co
 	}
 
 	// will go to attacker.ServeHTTP
-	a.serveConn(clientTlsConn, connCtx)
+	a.serveConn(clientTlsConn, connCtx, ctx)
 }
 
 func (a *attacker) httpsLazyAttack(ctx context.Context, cconn net.Conn, req *http.Request) {
@@ -405,7 +457,7 @@ func (a *attacker) httpsLazyAttack(ctx context.Context, cconn net.Conn, req *htt
 
 	// will go to attacker.ServeHTTP
 	a.initHttpsDialFn(req)
-	a.serveConn(clientTlsConn, connCtx)
+	a.serveConn(clientTlsConn, connCtx, ctx)
 }
 
 func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
@@ -425,7 +477,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 				}
 			}
 		}
-		if response.close {
+		if response.Close {
 			res.Header().Add("Connection", "close")
 		}
 		res.WriteHeader(response.StatusCode)
@@ -483,7 +535,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		reqBody = r
 		if err != nil {
 			log.Error(err)
-			res.WriteHeader(502)
+			res.WriteHeader(http.StatusBadGateway)
 			return
 		}
 
@@ -513,7 +565,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 	proxyReq, err := http.NewRequestWithContext(proxyReqCtx, f.Request.Method, f.Request.URL.String(), reqBody)
 	if err != nil {
 		log.Error(err)
-		res.WriteHeader(502)
+		res.WriteHeader(http.StatusBadGateway)
 		return
 	}
 
@@ -542,15 +594,18 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 					httpError(res, "", http.StatusProxyAuthRequired)
 					return
 				}
-				res.WriteHeader(502)
+				res.WriteHeader(http.StatusBadGateway)
 				return
 			}
 		}
+		if a.proxy.Opts.TracingOptions != nil || a.proxy.Opts.MetricsOptions != nil {
+			f.ConnContext.ServerConn.client.Transport = otelhttp.NewTransport(f.ConnContext.ServerConn.client.Transport)
+		} // end if
 		proxyRes, err = f.ConnContext.ServerConn.client.Do(proxyReq)
 	}
 	if err != nil {
 		logErr(log, err)
-		res.WriteHeader(502)
+		res.WriteHeader(http.StatusBadGateway)
 		return
 	}
 
@@ -563,7 +618,8 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 	f.Response = &Response{
 		StatusCode: proxyRes.StatusCode,
 		Header:     proxyRes.Header,
-		close:      proxyRes.Close,
+		Close:      proxyRes.Close,
+		raw:        proxyRes,
 	}
 
 	// trigger addon event Responseheaders
@@ -582,7 +638,7 @@ func (a *attacker) attack(res http.ResponseWriter, req *http.Request) {
 		resBody = r
 		if err != nil {
 			log.Error(err)
-			res.WriteHeader(502)
+			res.WriteHeader(http.StatusBadGateway)
 			return
 		}
 		if resBuf == nil {
